@@ -33,6 +33,9 @@ type Runner struct {
 	// in case we need to bail
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	runErr     error
+	runErrOnce sync.Once
 }
 
 // New gets a new Runner ready for probing.
@@ -96,6 +99,18 @@ func (run *Runner) runWriters(result *models.Result) error {
 	return nil
 }
 
+// setRunError records the first scan-level failure. Target-level failures are
+// still handled individually and do not make the whole invocation fail.
+func (run *Runner) setRunError(err error) {
+	if err == nil {
+		return
+	}
+
+	run.runErrOnce.Do(func() {
+		run.runErr = err
+	})
+}
+
 // checkUrl ensures a url is valid
 func (run *Runner) checkUrl(target string) error {
 	url, err := url.ParseRequestURI(target)
@@ -145,6 +160,7 @@ func (run *Runner) Run() {
 						var chromeErr *ChromeNotFoundError
 						if errors.As(err, &chromeErr) {
 							run.log.Error("no valid chrome installation found", "err", err)
+							run.setRunError(err)
 							run.cancel()
 							return
 						}
@@ -166,6 +182,7 @@ func (run *Runner) Run() {
 
 					if err := run.runWriters(result); err != nil {
 						run.log.Error("failed to write result for target", "target", target, "err", err)
+						run.setRunError(err)
 					}
 
 					run.log.Info("result 🤖", "target", target, "status-code", result.ResponseCode,
@@ -183,4 +200,17 @@ func (run *Runner) Run() {
 func (run *Runner) Close() {
 	// close the driver
 	run.Driver.Close()
+
+	// Finalize writers only when they explicitly opt into the run lifecycle.
+	// Existing writers implement Writer alone, so their behavior is unchanged.
+	for _, writer := range run.writers {
+		closer, ok := writer.(writers.RunCloser)
+		if !ok {
+			continue
+		}
+
+		if err := closer.CloseRun(run.runErr); err != nil {
+			run.log.Error("failed to finalize result writer", "err", err)
+		}
+	}
 }

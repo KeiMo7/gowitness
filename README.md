@@ -43,6 +43,31 @@ gowitness scan single --url "https://sensepost.com" --write-db
 
 There are many, *many* flags and scan types in `gowitness`. Just add `-h` anywhere and read all about it!
 
+## SARIF output
+
+SARIF 2.1.0 output is opt-in and does not change the default terminal,
+screenshot, database, JSON Lines, or CSV output:
+
+```text
+gowitness scan file -f targets.txt --write-sarif --write-sarif-file gowitness.sarif
+```
+
+Each finding is emitted as a separate SARIF result. Rule IDs are static
+`gowitness.*` identifiers, and severity is mapped in one table
+(`high` -> `error`, `medium` -> `warning`, `hint`/`info` -> `note`).
+Artifact paths are repository-relative URI references; paths outside the
+repository, symlinks that escape it, over-long paths, and non-UTF-8 paths are
+replaced with deterministic `gowitness-external/` URIs. URLs have userinfo and
+sensitive query values redacted.
+
+Results are streamed to a temporary file and published atomically only after a
+streaming self-check passes. A scan-level failure is recorded with
+`invocations[].executionSuccessful=false`; a generation failure leaves the
+previous output untouched and never publishes a partial JSON document. The
+feature can be rolled back without a data migration by omitting
+`--write-sarif` (or reverting this change); no existing output path reads the
+new file.
+
 ## documentation
 
 For advanced installation information and other documentation, please refer to the wiki [here](https://github.com/sensepost/gowitness/wiki).

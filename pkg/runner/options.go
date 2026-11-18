@@ -59,6 +59,8 @@ type Writer struct {
 	CsvFile   string
 	Jsonl     bool
 	JsonlFile string
+	Sarif     bool
+	SarifFile string
 	Stdout    bool
 	None      bool
 }

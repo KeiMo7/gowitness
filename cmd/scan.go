@@ -81,6 +81,15 @@ flags.`)),
 			scanWriters = append(scanWriters, w)
 		}
 
+		if opts.Writer.Sarif {
+			w, err := writers.NewSarifWriter(opts.Writer.SarifFile)
+			if err != nil {
+				return err
+			}
+			w.ScreenshotPath = opts.Scan.ScreenshotPath
+			scanWriters = append(scanWriters, w)
+		}
+
 		if opts.Writer.Db {
 			w, err := writers.NewDbWriter(opts.Writer.DbURI, opts.Writer.DbDebug)
 			if err != nil {
@@ -171,6 +180,12 @@ func init() {
 	scanCmd.PersistentFlags().StringVar(&opts.Writer.CsvFile, "write-csv-file", "gowitness.csv", "The file to write CSV rows to")
 	scanCmd.PersistentFlags().BoolVar(&opts.Writer.Jsonl, "write-jsonl", false, "Write results as JSON lines")
 	scanCmd.PersistentFlags().StringVar(&opts.Writer.JsonlFile, "write-jsonl-file", "gowitness.jsonl", "The file to write JSON lines to")
+	scanCmd.PersistentFlags().BoolVar(&opts.Writer.Sarif, "write-sarif", false, "Write results as SARIF 2.1.0")
+	scanCmd.PersistentFlags().StringVar(&opts.Writer.SarifFile, "write-sarif-file", "gowitness.sarif", "The file to write SARIF results to")
+	scanCmd.PersistentFlags().BoolVar(&opts.Writer.Sarif, "sarif", false, "Alias for --write-sarif")
+	scanCmd.PersistentFlags().StringVar(&opts.Writer.SarifFile, "sarif-file", "gowitness.sarif", "Alias for --write-sarif-file")
+	_ = scanCmd.PersistentFlags().MarkHidden("sarif")
+	_ = scanCmd.PersistentFlags().MarkHidden("sarif-file")
 	scanCmd.PersistentFlags().BoolVar(&opts.Writer.Stdout, "write-stdout", false, "Write successful results to stdout (usefull in a shell pipeline)")
 	scanCmd.PersistentFlags().BoolVar(&opts.Writer.None, "write-none", false, "Use an empty writer to silence warnings")
 }
