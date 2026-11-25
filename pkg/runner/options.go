@@ -1,5 +1,7 @@
 package runner
 
+import "time"
+
 // Options are global gowitness options
 type Options struct {
 	// Logging is logging options
@@ -104,6 +106,18 @@ type Scan struct {
 	// HttpCodeFilter are http response codes to screenshot. this is a filter.
 	// by default all codes are screenshotted
 	HttpCodeFilter []int
+
+	// DedupTargets enables canonical target admission so repeated targets
+	// are only witnessed once.
+	DedupTargets bool
+	// DedupMaxTargets is the admission table capacity.
+	DedupMaxTargets int
+	// DedupWindow is the admission TTL; zero means entries never expire.
+	DedupWindow time.Duration
+	// DedupHamming is the perception-hash grouping distance threshold.
+	DedupHamming int
+	// DedupMaxGroups is the shared DB writer group index capacity.
+	DedupMaxGroups int
 }
 
 // NewDefaultOptions returns Options with some default values
@@ -121,6 +135,12 @@ func NewDefaultOptions() *Options {
 			UriFilter:        []string{"http", "https"},
 			ScreenshotFormat: "jpeg",
 			HttpCodeFilter:   []int{},
+
+			DedupTargets:    true,
+			DedupMaxTargets: 200000,
+			DedupWindow:     0,
+			DedupHamming:    10,
+			DedupMaxGroups:  100000,
 		},
 		Logging: Logging{
 			Debug:         true,

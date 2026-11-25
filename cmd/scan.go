@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/sensepost/gowitness/internal/ascii"
+	"github.com/sensepost/gowitness/pkg/dedup"
 	"github.com/sensepost/gowitness/pkg/log"
 	"github.com/sensepost/gowitness/pkg/runner"
 	driver "github.com/sensepost/gowitness/pkg/runner/drivers"
@@ -82,7 +83,10 @@ flags.`)),
 		}
 
 		if opts.Writer.Db {
-			w, err := writers.NewDbWriter(opts.Writer.DbURI, opts.Writer.DbDebug)
+			w, err := writers.NewDbWriter(opts.Writer.DbURI, opts.Writer.DbDebug, dedup.GroupOptions{
+				Threshold: opts.Scan.DedupHamming,
+				MaxGroups: opts.Scan.DedupMaxGroups,
+			})
 			if err != nil {
 				return err
 			}
@@ -152,6 +156,13 @@ func init() {
 	scanCmd.PersistentFlags().BoolVar(&opts.Scan.SkipNetworkLogs, "skip-network-logs", false, "Don't include per-request network logs when writing results (also disables save-content)")
 	scanCmd.PersistentFlags().BoolVar(&opts.Scan.ScreenshotToWriter, "write-screenshots", false, "Store screenshots with writers in addition to filesystem storage")
 	scanCmd.PersistentFlags().IntSliceVar(&opts.Scan.HttpCodeFilter, "http-code-filter", []int{}, "Http response codes to screenshot. This is a filter (by default all codes are screenshotted)")
+
+	// Target deduplication & hash grouping
+	scanCmd.PersistentFlags().BoolVar(&opts.Scan.DedupTargets, "dedup-targets", true, "Canonicalize targets and only witness each distinct target once per run")
+	scanCmd.PersistentFlags().IntVar(&opts.Scan.DedupMaxTargets, "dedup-max-targets", 200000, "Maximum number of targets tracked by the admission index")
+	scanCmd.PersistentFlags().DurationVar(&opts.Scan.DedupWindow, "dedup-window", 0, "Duration after which an admitted target may be scanned again (e.g. 10m, 1h); 0 keeps it for the whole run")
+	scanCmd.PersistentFlags().IntVar(&opts.Scan.DedupHamming, "dedup-hamming", 10, "Maximum Hamming distance for perception hash grouping (0-64)")
+	scanCmd.PersistentFlags().IntVar(&opts.Scan.DedupMaxGroups, "dedup-max-groups", 100000, "Maximum number of active perception hash groups per database")
 
 	// Chrome options
 	scanCmd.PersistentFlags().StringVar(&opts.Chrome.Path, "chrome-path", "", "The path to a Google Chrome binary to use (downloads a platform-appropriate binary by default)")

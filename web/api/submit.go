@@ -95,7 +95,10 @@ func (h *ApiHandler) SubmitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// have everything we need! start ther runner goroutine
-	go dispatchRunner(runner, request.URLs)
+	go func() {
+		defer writer.Close()
+		dispatchRunner(runner, request.URLs)
+	}()
 
 	response := `Probing started`
 	jsonData, err := json.Marshal(response)

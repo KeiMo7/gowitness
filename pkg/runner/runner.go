@@ -10,6 +10,7 @@ import (
 
 	wappalyzer "github.com/projectdiscovery/wappalyzergo"
 	"github.com/sensepost/gowitness/internal/islazy"
+	"github.com/sensepost/gowitness/pkg/dedup"
 	"github.com/sensepost/gowitness/pkg/models"
 	"github.com/sensepost/gowitness/pkg/writers"
 )
@@ -30,14 +31,30 @@ type Runner struct {
 	// This would typically be fed from a gowitness/pkg/reader.
 	Targets chan string
 
+	// targetIndex is the optional canonical target admission table. It is
+	// nil when Scan.DedupTargets is false.
+	targetIndex *dedup.TargetIndex
+
 	// in case we need to bail
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
+// targetJob pairs the original, unmodified input with its admission ticket.
+type targetJob struct {
+	raw    string
+	ticket *dedup.Ticket
+}
+
 // New gets a new Runner ready for probing.
 // It's up to the caller to call Close() on the runner
 func NewRunner(logger *slog.Logger, driver Driver, opts Options, writers []writers.Writer) (*Runner, error) {
+	// A nil logger is tolerated; fall back to the slog default so all log
+	// paths stay safe.
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	if !opts.Scan.ScreenshotSkipSave {
 		screenshotPath, err := islazy.CreateDir(opts.Scan.ScreenshotPath)
 		if err != nil {
@@ -71,18 +88,46 @@ func NewRunner(logger *slog.Logger, driver Driver, opts Options, writers []write
 		return nil, err
 	}
 
+	var targetIndex *dedup.TargetIndex
+	if opts.Scan.DedupTargets {
+		maxEntries := opts.Scan.DedupMaxTargets
+		if maxEntries <= 0 {
+			maxEntries = 200000
+		}
+
+		idx, err := dedup.NewTargetIndex(dedup.TargetOptions{
+			MaxEntries: maxEntries,
+			TTL:        opts.Scan.DedupWindow,
+		})
+		if err != nil {
+			return nil, err
+		}
+		targetIndex = idx
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Runner{
-		Driver:     driver,
-		Wappalyzer: wap,
-		options:    opts,
-		writers:    writers,
-		Targets:    make(chan string),
-		log:        logger,
-		ctx:        ctx,
-		cancel:     cancel,
+		Driver:      driver,
+		Wappalyzer:  wap,
+		options:     opts,
+		writers:     writers,
+		Targets:     make(chan string),
+		targetIndex: targetIndex,
+		log:         logger,
+		ctx:         ctx,
+		cancel:      cancel,
 	}, nil
+}
+
+// TargetStats returns a snapshot of the target admission index. When target
+// deduplication is disabled the zero value is returned.
+func (run *Runner) TargetStats() dedup.TargetStats {
+	if run.targetIndex == nil {
+		return dedup.TargetStats{}
+	}
+
+	return run.targetIndex.Stats()
 }
 
 // runWriters takes a result and passes it to writers
@@ -113,71 +158,190 @@ func (run *Runner) checkUrl(target string) error {
 // Run executes the runner, processing targets as they arrive
 // in the Targets channel
 func (run *Runner) Run() {
-	wg := sync.WaitGroup{}
+	threads := run.options.Scan.Threads
+	if threads < 1 {
+		threads = 1
+	}
 
-	// will spawn Scan.Theads number of "workers" as goroutines
-	for w := 0; w < run.options.Scan.Threads; w++ {
-		wg.Add(1)
+	// Internal work channel. Its capacity matches the worker count. It is
+	// closed by the dispatcher once it exits (for example after Targets is
+	// closed or the run context is cancelled).
+	jobs := make(chan targetJob, threads)
 
-		// start a worker
+	var dispatcherWG sync.WaitGroup
+	dispatcherWG.Add(1)
+	go func() {
+		defer dispatcherWG.Done()
+		run.dispatch(jobs)
+	}()
+
+	var workersWG sync.WaitGroup
+	for w := 0; w < threads; w++ {
+		workersWG.Add(1)
 		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-run.ctx.Done():
-					return
-				case target, ok := <-run.Targets:
-					if !ok {
-						return
-					}
-
-					// validate the target
-					if err := run.checkUrl(target); err != nil {
-						if run.options.Logging.LogScanErrors {
-							run.log.Error("invalid target to scan", "target", target, "err", err)
-						}
-						continue
-					}
-
-					result, err := run.Driver.Witness(target, run)
-					if err != nil {
-						// is this a chrome not found error?
-						var chromeErr *ChromeNotFoundError
-						if errors.As(err, &chromeErr) {
-							run.log.Error("no valid chrome installation found", "err", err)
-							run.cancel()
-							return
-						}
-
-						if run.options.Logging.LogScanErrors {
-							run.log.Error("failed to witness target", "target", target, "err", err)
-						}
-						continue
-					}
-
-					// assume that status code 0 means there was no information, so
-					// don't send anything to writers.
-					if result.ResponseCode == 0 {
-						if run.options.Logging.LogScanErrors {
-							run.log.Error("failed to witness target, status code was 0", "target", target)
-						}
-						continue
-					}
-
-					if err := run.runWriters(result); err != nil {
-						run.log.Error("failed to write result for target", "target", target, "err", err)
-					}
-
-					run.log.Info("result 🤖", "target", target, "status-code", result.ResponseCode,
-						"title", result.Title, "have-screenshot", !result.Failed)
-
-				}
-			}
-
+			defer workersWG.Done()
+			run.worker(jobs)
 		}()
 	}
 
-	wg.Wait()
+	// The dispatcher owns closing the jobs channel.
+	dispatcherWG.Wait()
+	workersWG.Wait()
+
+	// Jobs buffered in the work channel were never claimed by a worker
+	// (typically after cancellation). Release their tickets so no inflight
+	// entries are left behind. At this point both the dispatcher and all
+	// workers have exited and jobs is closed.
+	for job := range jobs {
+		if run.targetIndex != nil && job.ticket != nil {
+			run.targetIndex.Release(job.ticket)
+		}
+	}
+
+	stats := run.TargetStats()
+	run.log.Info("target admission summary",
+		"admitted", stats.Admitted,
+		"suppressed", stats.Suppressed,
+		"released", stats.Released,
+		"expired", stats.Expired,
+		"evicted", stats.Evicted,
+		"inflight", stats.InFlight,
+		"done", stats.Done,
+	)
+}
+
+// dispatch is the single goroutine that reads raw inputs, validates and
+// admits them, and hands work to the worker pool. Admission order is thus
+// total and deterministic.
+func (run *Runner) dispatch(jobs chan<- targetJob) {
+	defer close(jobs)
+
+	for {
+		select {
+		case <-run.ctx.Done():
+			// Cancellation (e.g. ChromeNotFoundError) stops admission. We do
+			// not block here: Targets is owned and closed by its producer.
+			return
+		case raw, ok := <-run.Targets:
+			if !ok {
+				return
+			}
+
+			if err := run.checkUrl(raw); err != nil {
+				if run.options.Logging.LogScanErrors {
+					run.log.Error("invalid target to scan", "target", raw, "err", err)
+				}
+				continue
+			}
+
+			job := targetJob{raw: raw}
+
+			if run.targetIndex != nil {
+				key, err := dedup.CanonicalTarget(raw)
+				if err != nil {
+					if run.options.Logging.LogScanErrors {
+						run.log.Error("invalid target to scan", "target", raw, "err", err)
+					}
+					continue
+				}
+
+				ticket, admitted := run.targetIndex.Admit(key)
+				if !admitted {
+					run.log.Debug("suppressed duplicate target",
+						"target", raw, "canonical", key.String())
+					continue
+				}
+				job.ticket = ticket
+			}
+
+			// Hand off without ever blocking past cancellation.
+			select {
+			case jobs <- job:
+			case <-run.ctx.Done():
+				// The ticket never reached a worker; release it.
+				if job.ticket != nil {
+					run.targetIndex.Release(job.ticket)
+				}
+				return
+			}
+		}
+	}
+}
+
+// worker processes jobs until the jobs channel closes or the run context is
+// cancelled.
+func (run *Runner) worker(jobs <-chan targetJob) {
+	for {
+		select {
+		case <-run.ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+
+			// A cancellation may have raced the dequeue; do not start new
+			// work afterwards. The Run cleanup drains remaining jobs.
+			if run.ctx.Err() != nil {
+				if run.targetIndex != nil && job.ticket != nil {
+					run.targetIndex.Release(job.ticket)
+				}
+				return
+			}
+
+			run.process(job)
+		}
+	}
+}
+
+// process witnesses a single job and resolves its admission ticket exactly
+// once: Commit on full success, Release on every other outcome. Release after
+// Commit is a token/state no-op, so the deferred call is always safe.
+func (run *Runner) process(job targetJob) {
+	target := job.raw
+
+	if run.targetIndex != nil && job.ticket != nil {
+		defer run.targetIndex.Release(job.ticket)
+	}
+
+	result, err := run.Driver.Witness(target, run)
+	if err != nil {
+		// is this a chrome not found error? Accept both the pointer form
+		// returned by the real drivers and the value form.
+		var chromeErr *ChromeNotFoundError
+		var chromeErrValue ChromeNotFoundError
+		if errors.As(err, &chromeErr) || errors.As(err, &chromeErrValue) {
+			run.log.Error("no valid chrome installation found", "err", err)
+			run.cancel()
+			return
+		}
+
+		if run.options.Logging.LogScanErrors {
+			run.log.Error("failed to witness target", "target", target, "err", err)
+		}
+		return
+	}
+
+	// assume that status code 0 means there was no information, so
+	// don't send anything to writers.
+	if result.ResponseCode == 0 {
+		if run.options.Logging.LogScanErrors {
+			run.log.Error("failed to witness target, status code was 0", "target", target)
+		}
+		return
+	}
+
+	if err := run.runWriters(result); err != nil {
+		run.log.Error("failed to write result for target", "target", target, "err", err)
+		return
+	}
+
+	if run.targetIndex != nil && job.ticket != nil {
+		run.targetIndex.Commit(job.ticket)
+	}
+
+	run.log.Info("result 🤖", "target", target, "status-code", result.ResponseCode,
+		"title", result.Title, "have-screenshot", !result.Failed)
 }
 
 func (run *Runner) Close() {
